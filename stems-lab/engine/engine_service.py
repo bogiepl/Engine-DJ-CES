@@ -453,6 +453,8 @@ def separate_track(path: pathlib.Path, start: float | None, end: float | None, o
         if freed:
             log(f"[clean] scratch removed, {freed / 1048576:.0f} MB reclaimed ({tmp.name})")
 
+# Semafor ograniczający liczbę jednocześnie przetwarzanych zadań na GPU do 1 (ochrona 8GB VRAM)
+_GPU_LIMIT_SEMAPHORE = threading.Semaphore(1)
 
 _JOB_LOCKS = {}
 _JOB_LOCKS_GUARD = threading.Lock()
@@ -508,41 +510,44 @@ def handle_separate(req: dict, segment: str | None) -> dict:
     if hit is not None:
         return {"ok": True, **hit}
 
-    start = end = None
-    if segment:
-        a, b = segment.split(":")
-        start, end = float(a), float(b)
+    # GLOBALNA BLOKADA GPU: dopuszcza do karty tylko jedno zadanie naraz, 
+    # reszta czeka w kolejce TCP bez ryzyka OOM na karcie 8GB.
+    with _GPU_LIMIT_SEMAPHORE:
+        # Sprawdzamy cache jeszcze raz w razie, gdyby poprzedni wątek w kolejce właśnie to skończył
+        hit = cached_result(outdir, key, path.name)
+        if hit is not None:
+            return {"ok": True, **hit}
 
-    # One separation per cache key at a time. Two Engine DJ windows - or a retry while the first
-    # job still looks slow - would otherwise write the same `_tmp` scratch and the same stem
-    # files, and whichever finished first would delete the other's scratch on the way out. The
-    # loser then never finished at all, and both ran at half speed for sharing the CPU.
-    lock = job_lock(key)
-    if lock.acquire(blocking=False):
-        waited = False
-    else:
-        log(f"[queue] {path.name} is already separating under {key} - waiting for that job instead of starting a second one")
-        lock.acquire()
-        waited = True
+        start = end = None
+        if segment:
+            a, b = segment.split(":")
+            start, end = float(a), float(b)
 
-    try:
-        if waited:
-            hit = cached_result(outdir, key, path.name)
-            if hit is not None:
-                log(f"[queue] {path.name} was finished by the job we waited for - serving it from cache")
-                return {"ok": True, **hit}
+        # Oryginalna blokada per-key (chroni przed duplikatami tego samego pliku)
+        lock = job_lock(key)
+        if lock.acquire(blocking=False):
+            waited = False
+        else:
+            log(f"[queue] {path.name} is already separating under {key} - waiting for that job instead of starting a second one")
+            lock.acquire()
+            waited = True
 
-        log(f"[separate] {path.name} -> {key}")
-        result = separate_track(path, start, end, outdir)
-        result["cache_key"] = key
-        (outdir / "manifest.json").write_text(
-            json.dumps({k: v for k, v in result.items() if k != "cached"}, indent=2), encoding="utf-8"
-        )
-        return {"ok": True, **result}
-    finally:
-        lock.release()
+        try:
+            if waited:
+                hit = cached_result(outdir, key, path.name)
+                if hit is not None:
+                    log(f"[queue] {path.name} was finished by the job we waited for - serving it from cache")
+                    return {"ok": True, **hit}
 
-
+            log(f"[separate] {path.name} -> {key}")
+            result = separate_track(path, start, end, outdir)
+            result["cache_key"] = key
+            (outdir / "manifest.json").write_text(
+                json.dumps({k: v for k, v in result.items() if k != "cached"}, indent=2), encoding="utf-8"
+            )
+            return {"ok": True, **result}
+        finally:
+            lock.release()
 def bind_listener(host: str, port: int) -> socket.socket:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # On Windows SO_REUSEADDR lets a second process bind a port that is already being listened
